@@ -1,0 +1,117 @@
+# Build -> push par digest -> provenance SLSA -> SBOM atteste -> signature Cosign keyless
+# Inspire du Lab 3 "Build verifiable" (stephane-robert.info), adapte au projet G2.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+# Moindre privilege : rien par defaut, tout est accorde explicitement au job.
+permissions: {}
+
+env:
+  COSIGN_VERSION: v3.1.1   # meme version que CT2 (TD module 11) : evite le piege de format 2.x/3.x
+
+jobs:
+  build-sign-attest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      packages: write       # push sur GHCR
+      id-token: write       # jeton OIDC -> certificat Fulcio (keyless)
+      attestations: write   # provenance SLSA + SBOM attestes
+    outputs:
+      image: ${{ steps.img.outputs.name }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout (sans credentials persistants)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Nom d'image en minuscules
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Connexion a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags et labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build et push (le digest devient le sujet unique de tout le reste)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # On desactive les attestations buildx pour garder un manifeste simple :
+          # la provenance est produite par attest-build-provenance ci-dessous.
+          provenance: false
+          sbom: false
+
+      - name: Provenance SLSA (native GitHub)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.img.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generation du SBOM (Syft, CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.img.outputs.name }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attestation du SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.img.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+
+      - name: Installation de Cosign
+        uses: sigstore/cosign-installer@v4
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Signature keyless (Fulcio + Rekor), par digest
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}   # passe par env: (pas d'injection de template dans run:)
+        run: |
+          cosign version
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Resume pour le verificateur
+        env:
+          IMAGE: ${{ steps.img.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## Image publiee"
+            echo ""
+            echo "- Reference : \`${IMAGE}@${DIGEST}\`"
+            echo "- Identite attendue : \`https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}\`"
+            echo "- Emetteur OIDC : \`https://token.actions.githubusercontent.com\`"
+          } >> "$GITHUB_STEP_SUMMARY"

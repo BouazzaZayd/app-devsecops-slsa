@@ -1,0 +1,230 @@
+name: devsecops-pipeline
+
+on: [push]
+jobs:
+  sast-semgrep:
+    runs-on: ubuntu-22.04
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/semgrep:1.167.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analyse statique Semgrep
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: semgrep scan --config auto --error --no-git-ignore --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag .
+
+  sca-trivy:
+    runs-on: ubuntu-22.04
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/trivy:0.71.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit des dependances Trivy
+        run: trivy fs --severity MEDIUM,HIGH,CRITICAL --exit-code 1 .
+
+  secret-scan:
+    runs-on: ubuntu-22.04
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/trufflehog:3.95.6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detection de secrets TruffleHog
+        run: trufflehog git file://. --no-update --no-verification --fail
+
+  sonarqube:
+    runs-on: ubuntu-22.04
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/sonar-scanner:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Analyse SonarQube
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          sonar-scanner \
+            -Dsonar.host.url=http://10.0.0.21:9000 \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.coverage.exclusions=**
+      - name: Verification du Quality Gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          sleep 10
+          STATUS=$(curl -s \
+            -u "${SONAR_TOKEN}:" \
+            "http://10.0.0.21:9000/api/qualitygates/project_status?projectKey=app-devsecops" \
+            | jq -r '.projectStatus.status')
+          echo "Quality Gate: $STATUS"
+          if [ "$STATUS" != "OK" ]; then
+            echo "Quality Gate FAILED -- pipeline bloque"
+            exit 1
+          fi
+
+  build-and-push:
+    runs-on: ubuntu-22.04
+    needs: [sast-semgrep, sca-trivy, secret-scan, sonarqube]
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/docker-node:27
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build de l'image
+        run: docker build --tag app-devsecops:${{ github.sha }} .
+      - name: Authentification registre
+        env:
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+          ZOT_USERNAME: ${{ secrets.ZOT_USERNAME }}
+        run: |
+          echo "$ZOT_PASSWORD" | docker login 10.0.0.13:5000 \
+            --username "$ZOT_USERNAME" --password-stdin
+      - name: Publication
+        run: |
+          docker tag app-devsecops:${{ github.sha }} \
+            10.0.0.13:5000/app-devsecops:${{ github.sha }}
+          docker push 10.0.0.13:5000/app-devsecops:${{ github.sha }}
+
+  generate-sbom:
+    runs-on: ubuntu-22.04
+    needs: [build-and-push]
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/sbom-tools:1.0
+    steps:
+      - name: Generation du SBOM
+        env:
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ secrets.ZOT_USERNAME }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+          SYFT_REGISTRY_INSECURE_USE_HTTP: "true"
+        run: |
+          syft registry:10.0.0.13:5000/app-devsecops:${{ github.sha }} \
+            -o spdx-json > sbom.json
+          echo "Composants identifies : $(jq '.packages | length' sbom.json)"
+      - name: Publication du SBOM dans Zot
+        env:
+          ZOT_USERNAME: ${{ secrets.ZOT_USERNAME }}
+          ZOT_PASSWORD: ${{ secrets.ZOT_PASSWORD }}
+        run: |
+          echo "$ZOT_PASSWORD" | oras push \
+            10.0.0.13:5000/app-devsecops/sbom:${{ github.sha }} \
+            --plain-http \
+            --username "$ZOT_USERNAME" \
+            --password-stdin \
+            sbom.json:application/spdx+json
+
+  deploy-staging:
+    runs-on: ubuntu-22.04
+    needs: [generate-sbom]
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/docker-node:latest
+    steps:
+      - name: Configuration SSH
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "$SSH_DEPLOY_KEY" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H 10.0.0.14 >> ~/.ssh/known_hosts
+
+      - name: Deploiement vers VM4
+        env:
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 debian@10.0.0.14 "
+            docker pull 10.0.0.13:5000/app-devsecops:${{ github.sha }} &&
+            docker stop app-staging 2>/dev/null || true &&
+            docker rm app-staging 2>/dev/null || true &&
+            docker run -d --name app-staging -p 8080:8080 \
+              -e FLASK_HOST=0.0.0.0 \
+              -e ADMIN_TOKEN=${ADMIN_TOKEN} \
+              10.0.0.13:5000/app-devsecops:${{ github.sha }} &&
+            sleep 5 &&
+            curl -s http://localhost:8080/health
+          "
+
+      - name: Attente active du demarrage sur VM4
+        run: |
+          echo "[*] Attente du demarrage de l'application sur VM4..."
+          until curl -s http://10.0.0.14:8080/health | grep -q "ok"; do
+            sleep 1
+          done
+          echo "[+] Application en ligne sur VM4."
+
+  dast-zap:
+    runs-on: ubuntu-22.04
+    needs: [deploy-staging]
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/docker-node:latest
+    steps:
+      - name: Scan DAST ZAP
+        run: |
+          mkdir -p /tmp/zap-results && chmod 777 /tmp/zap-results
+
+          docker run --name zap-scan \
+            -v /tmp/zap-results:/zap/wrk/:rw \
+            dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/zap:stable \
+            zap-api-scan.py \
+            -t http://10.0.0.14:8080/openapi.json \
+            -f openapi \
+            -r zap-report.html \
+            -l WARN || ZAP_EXIT_CODE=$?
+          ZAP_EXIT_CODE=${ZAP_EXIT_CODE:-0}
+
+          mkdir -p zap-results
+          docker cp zap-scan:/zap/wrk/zap-report.html zap-results/zap-report.html || true
+          docker rm zap-scan
+
+          exit $ZAP_EXIT_CODE
+      - name: Publication du rapport ZAP
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: zap-report
+          path: zap-results/zap-report.html
+
+  dast-nuclei:
+    runs-on: ubuntu-22.04
+    needs: [deploy-staging]
+    container:
+      image: dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/docker-node:latest
+    steps:
+      - name: Scan DAST Nuclei
+        run: |
+          docker run --name nuclei-scan \
+            --network host \
+            dockerhub-private.terraform.cyberfarm.insa-cvl.fr/devsecops/nuclei:3.9.0 \
+            nuclei -u http://10.0.0.14:8080 \
+            -t /nuclei-templates/ \
+            -severity high,critical \
+            -rate-limit 10 \
+            -nc \
+            -o /tmp/nuclei-report.txt || NUCLEI_EXIT_CODE=$?
+
+          NUCLEI_EXIT_CODE=${NUCLEI_EXIT_CODE:-0}
+
+          mkdir -p nuclei-results
+          docker cp nuclei-scan:/tmp/nuclei-report.txt nuclei-results/nuclei-report.txt || true
+          docker rm nuclei-scan
+
+          if [ -f nuclei-results/nuclei-report.txt ]; then
+            MATCHES=$(grep -c -E "\[high\]|\[critical\]" nuclei-results/nuclei-report.txt || true)
+          else
+            MATCHES=0
+          fi
+
+          echo "Critical or High findings detected: $MATCHES"
+
+          if [ "$MATCHES" -gt 0 ]; then
+            echo "CRITICAL/HIGH vulnerabilities found by Nuclei -- Failing pipeline."
+            exit 1
+          fi
+      - name: Publication du rapport Nuclei
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: nuclei-report
+          path: nuclei-results/nuclei-report.txt
+

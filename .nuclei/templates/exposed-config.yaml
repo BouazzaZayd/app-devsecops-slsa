@@ -1,0 +1,20 @@
+id: exposed-admin-config
+info:
+  name: Configuration interne exposee sur /admin/config
+  author: lab
+  severity: high
+  tags: exposure,owasp
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/admin/config"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - "secret_key"
+          - "debug"
+        condition: and

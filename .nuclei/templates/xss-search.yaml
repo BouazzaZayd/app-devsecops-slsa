@@ -1,0 +1,14 @@
+id: xss-search-endpoint
+info:
+  name: XSS Reflechi sur /search
+  author: lab
+  severity: medium
+  tags: xss,owasp
+http:
+  - method: GET
+    path:
+      - "{{BaseURL}}/search?q=%3Cscript%3Ealert%281%29%3C%2Fscript%3E"
+    matchers:
+      - type: word
+        words:
+          - "<script>alert(1)</script>"
