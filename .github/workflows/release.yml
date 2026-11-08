@@ -112,12 +112,8 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Provenance SLSA (native GitHub, niveau L2 - remplacee en L3 a l'etape 2)
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ steps.img.outputs.name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+      # La provenance SLSA n'est plus produite ici (L2) : elle est generee en L3
+      # par un job isole, voir le job "provenance-slsa3" plus bas.
 
       - name: Generation du SBOM (Syft, CycloneDX)
         uses: anchore/sbom-action@v0
@@ -158,6 +154,24 @@ jobs:
           {
             echo "## Image publiee"
             echo "- Reference : ${IMAGE}@${DIGEST}"
-            echo "- Identite attendue : https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+            echo "- Identite attendue (cosign) : https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
             echo "- Emetteur OIDC : https://token.actions.githubusercontent.com"
+            echo "- Builder SLSA L3 : https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- Provenance SLSA niveau 3, generee dans un JOB ISOLE ----------
+  # Le generateur tourne sur une machine geree par GitHub, separee du build :
+  # notre code ne peut pas falsifier la provenance. C'est ce qui donne le L3.
+  provenance-slsa3:
+    needs: [build-sign-attest]
+    permissions:
+      actions: read        # lire les infos du workflow
+      id-token: write       # jeton OIDC -> signature keyless de la provenance (Fulcio/Rekor)
+      packages: write       # pousser la provenance sur GHCR, a cote de l'image
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build-sign-attest.outputs.image }}
+      digest: ${{ needs.build-sign-attest.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
