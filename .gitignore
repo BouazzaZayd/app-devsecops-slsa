@@ -1,0 +1,5 @@
+demo.env
+*.key
+cosign.key
+deploy_key
+*.pem
